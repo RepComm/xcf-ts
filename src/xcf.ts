@@ -77,6 +77,7 @@ export interface XCFReadResult {
   base_type?: GimpImageBaseType;
   precision?: GimpPrecision;
   properties?: Array<PropertyBase>;
+  layers?: Array<LayerDef>;
 }
 
 //WORD - int32 bi
@@ -84,18 +85,62 @@ export interface XCFReadResult {
 //STRING - uint32 n+1 , utf8 char[n], byte 0
 //Empty string - uint32 (0)
 
+/**(see enum GimpImageType in libgimpbase/gimpbaseenums.h)*/
+export enum GimpImageType {
+  "RGB_color_without alpha",
+  "RGB_color_with alpha",
+  "Grayscale_without_alpha",
+  "Grayscale_with_alpha",
+  "Indexed_without_alpha",
+  "Indexed_with_alpha",
+}
+
+export type GimpPointer = number|BigInt;
+
+export interface LayerDef {
+  /**uint32*/
+  width: number;
+  /**uint32*/
+  height: number;
+  /**uint32*/
+  type: GimpImageType;
+
+  name: string;
+
+  properties: Array<PropertyBase>;
+
+  //Pointer to the hierarchy structure with the pixels
+  hptr: GimpPointer;
+  //Pointer to the layer mask (a channel structure), or 0
+  mptr: GimpPointer;
+}
+
 export class XCFReader {
   view: DataView;
+  offsetStack: Array<number>;
   offset: number;
   textDecoder: TextDecoder;
 
   constructor() {
     this.textDecoder = new TextDecoder();
-
+    this.offsetStack = new Array();
   }
   init(ab: ArrayBuffer): this {
     this.view = new DataView(ab);
     this.offset = 0;
+    this.offsetStack.length = 0;
+    return this;
+  }
+  push (): this {
+    this.offsetStack.push(this.offset);
+    return this;
+  }
+  jump (offset: number): this {
+    this.offset = offset;
+    return this;
+  }
+  pop (): this {
+    this.offset = this.offsetStack.pop();
     return this;
   }
   word(signed: boolean = true): number {
@@ -116,14 +161,14 @@ export class XCFReader {
       this.view.getBigInt64(this.offset, false) :
       this.view.getBigUint64(this.offset, false);
 
-    this.offset += 4;
+    this.offset += 8;
     return result;
   }
-  pointer(xcfVersion: number): number | BigInt {
+  pointer(xcfVersion: number): GimpPointer {
     if (xcfVersion < 11) {
-      return this.word();
+      return this.word(false);
     } else {
-      return this.word64();
+      return this.word64(false);
     }
   }
   bytes(count: number): ArrayBuffer {
@@ -134,21 +179,31 @@ export class XCFReader {
     this.offset += count;
     return result;
   }
-  string(raw: boolean = false, count?: number, rawTrailingNull: boolean = false): string {
-    let size = (raw ? count : this.word()) || 0;
+  rawString (size: number): string {
     if (size < 1) return "";
 
     let strData = this.bytes(size);
     let result = this.textDecoder.decode(strData);
 
-    if (!raw || rawTrailingNull) {
-      this.offset += 1; //trailing null byte
-    }
+    //+1 for trailing null
+    this.offset ++;
+
+    return result;
+  }
+  string(): string {
+    let payloadLength = this.word(false);
+    let size = payloadLength - 1;
+    if (size < 1) return "";
+
+    let strData = this.bytes(size);
+    let result = this.textDecoder.decode(strData);
+
+    this.offset += 1; //trailing null byte
 
     return result;
   }
   version(): string {
-    return this.string(true, 13, true);
+    return this.rawString(13);
   }
   /**
    * Reads a property from a property list into 'out'
@@ -200,7 +255,7 @@ export class XCFReader {
             if (nameLength > 1) {
               let strData = pdv.buffer.slice(i, i + nameLength -1); i += nameLength;
               name = this.textDecoder.decode(strData);
-              i++; //trailing null
+              // i++; //trailing null
             }
 
             let flags = pdv.getUint32(i); i += 4;
@@ -234,7 +289,7 @@ export class XCFReader {
         break;
       default:
         //TODO - handle unknown types
-        console.warn("unknown property type", out.type);
+        // console.warn("unknown property type", out.type);
         break;
     }
 
@@ -258,7 +313,8 @@ export class XCFReader {
       precision: nv > 3 ?
         this.word(false) :
         GimpPrecision["8-bit_gamma_integer"],
-      properties: new Array()
+      properties: new Array(),
+      layers: new Array()
     };
 
     let prop: PropertyBase = {
@@ -278,17 +334,63 @@ export class XCFReader {
       if (prop.type === KnownPropIds.PARASITES) {
         let parasitesProp = prop as PROP_PARASITES;
         for (let parasite of parasitesProp.parasites) {
-          console.log("parasite", parasite.name);
-          if (parasite.name.toLowerCase() === "gimp-comment") {
-            let gimpComment = this.textDecoder.decode(parasite.payload);
-
-            console.log("gimp comment", gimpComment);
+          if (parasite.name.toLowerCase().startsWith("gimp")) {
+            let parasiteData = this.textDecoder.decode(parasite.payload);
+            console.log(`${parasite.name} : "${parasiteData}"`);
           }
         }
       }
     }
 
+    let ptr: BigInt|number = 0;
+    let layerPointers = new Array<GimpPointer>();
 
+    while ( (ptr = this.pointer(nv)) != 0) {
+      layerPointers.push(ptr);
+      if (ptr > this.view.byteLength) {
+        console.log("gtr than allowed");
+      }
+    }
+    
+    let channelPointers = new Array<GimpPointer>();
+    while ( (ptr = this.pointer(nv)) != 0) {
+      channelPointers.push(ptr);
+      if (ptr > this.view.byteLength) {
+        console.log("gtr than allowed");
+      }
+    }
+
+    this.push();
+    for (let lptr of layerPointers) {
+      let lptrn = new Number(lptr) as number;
+      this.jump(lptrn);
+      let layer: LayerDef = {
+        width: this.word(false),
+        height: this.word(false),
+        type: this.word(false),
+        name: this.string(),
+        properties: new Array(),
+        hptr: undefined,
+        mptr: undefined
+      };
+      while (this.property(prop)) {
+        let unique: PropertyBase = {
+          type: undefined,
+          length: undefined,
+        };
+  
+        Object.assign(unique, prop);
+        layer.properties.push(unique);
+      }
+
+      layer.hptr = this.pointer(nv);
+      layer.mptr = this.pointer(nv);
+
+      // console.log("Layer", layer);
+      result.layers.push(layer);
+
+    }
+    this.pop();
     
     return result;
   }

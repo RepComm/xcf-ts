@@ -8,4 +8,5 @@ Implemented:
   - base_type
   - precision
   - properties list (including parasites / gimp comments)
+  - layer definitions (w/h,properties)
   
