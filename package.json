@@ -27,7 +27,7 @@
     "typescript": "^4.7.4"
   },
   "scripts": {
-    "build": "babel src --extensions .ts --copy-files -d . && npm run build-types",
+    "build": "babel src --extensions .ts --copy-files -d .",
     "build-types": "npx tsc --project tsconfig.json",
     "publish": "npm publish --access public"
   },
